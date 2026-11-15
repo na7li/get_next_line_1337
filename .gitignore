@@ -1,5 +1,7 @@
 gnl_test
+gnl
 a.out
 *.o
 *.dSYM/
 .vscode/
+.claude/
