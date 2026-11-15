@@ -14,7 +14,7 @@ of the same function, so the bytes read "too far" by one call are not lost for t
 
 | File | Content |
 |---|---|
-| `get_next_line.c` | `get_next_line` + its 3 steps (`fill_stash`, `extract_line`, `trim_stash`) |
+| `get_next_line.c` | `get_next_line` + its 3 steps (`fill_stash`, `extract_line`, `trim_stash`) and `drop_stash` (free + NULL on every error path) |
 | `get_next_line_utils.c` | `gnl_strlen`, `gnl_strchr`, `gnl_strjoin`, `gnl_substr` |
 | `get_next_line.h` | prototypes, default `BUFFER_SIZE` (42) |
 | `*_bonus.[ch]` | same algorithm, one stash **per fd** → several fds at the same time |
@@ -28,15 +28,31 @@ cc -Wall -Wextra -Werror -D BUFFER_SIZE=42 get_next_line.c get_next_line_utils.c
 cc -Wall -Wextra -Werror -D BUFFER_SIZE=42 get_next_line_bonus.c get_next_line_utils_bonus.c main.c
 ```
 
-`-D BUFFER_SIZE=n` is optional (default 42). Any value works, from 1 to 10000000;
+`-D BUFFER_SIZE=n` is optional (default 42). Any value works, from 1 to 10000000 and above
+`INT_MAX` (sizes go through `size_t` / `ssize_t`, the buffer is on the heap);
 `BUFFER_SIZE <= 0` makes every call return `NULL`.
 
 ### Tests (`tests/` folder - not part of the submission)
 
 ```sh
-tests/run.sh                  # everything: norminette, 20 BUFFER_SIZEs, bonus, valgrind (~3 min)
+tests/run.sh                  # everything (~4 min), see the list below
 tests/run.sh /path/to/peer    # same checks on another student's repo
 ```
+
+`run.sh` checks, in order:
+- the required files exist, and norminette;
+- with `nm` on the compiled code: only `read`, `malloc`, `free` are used, no global variable;
+- 22 tests (20 mandatory + 2 strict) at 20 BUFFER_SIZEs from 1 to 10000000, without `-D`,
+  and with 0 and -5 (must return NULL); 6 more multi-fd tests for the bonus;
+- **malloc failure**: each malloc of a full read returns NULL once, in turn - no crash,
+  no wrong line;
+- **AddressSanitizer** at 7 sizes: buffer overflows, use-after-free, double free;
+- **valgrind** (or `leaks` on macOS): real leaks only ("definitely lost"), on the normal
+  build and on the malloc-failure build.
+
+Every test runs in its own process: a segfault is reported as `CRASH`, an infinite loop as
+`TIMEOUT`, and the other tests keep running. `WARN` = strict check (good practice, not a
+hard rule of the subject): don't fail a peer on a WARN alone.
 
 Evaluating someone else: clone this repo **outside** their folder, then point the script
 at their folder. Nothing is written into their repo (binaries go to `/tmp`).
@@ -49,13 +65,17 @@ cd /path/to/their/get_next_line && /tmp/gnl/tests/run.sh .
 Or by hand, for one BUFFER_SIZE:
 
 ```sh
-
 cc -Wall -Wextra -Werror -D BUFFER_SIZE=1 get_next_line.c get_next_line_utils.c tests/main.c -o gnl_test
-./gnl_test                    # 20 mandatory tests (each one in its own process)
+./gnl_test                    # 22 tests (each one in its own process)
 ./gnl_test bonus              # + 6 multi-fd tests (compile the _bonus files instead)
 ./gnl_test some_file.txt      # print a file line by line, cat -e style
 ./gnl_test -                  # same, from stdin (try: ./gnl_test - < get_next_line.c)
 valgrind --leak-check=full ./gnl_test --no-fork
+
+# malloc failure: compile THEIR files with the hook, then link with the tester
+cc -c -D BUFFER_SIZE=42 -include tests/fail_malloc.h get_next_line.c get_next_line_utils.c
+cc -D BUFFER_SIZE=42 -D GNL_FAIL_MALLOC tests/main.c get_next_line.o get_next_line_utils.o -o gnl_malloc
+./gnl_malloc malloc
 ```
 
 Remove `tests/` (or keep it out of the repo) before pushing to the Vogsphere repository.
@@ -73,6 +93,11 @@ Every call does three steps:
 3. **Keep the rest** - replace the stash with what comes after the line (or `NULL` if
    nothing is left), and return the line.
 
+Every error ends the same way: `return (drop_stash(&stash));` frees the stash, sets it to
+`NULL` and returns `NULL`. That covers a failed `read()`, and a failed malloc at any of the
+three places that allocate (the joined stash, the line, the rest). If the copy of the rest
+fails, the line is freed too: returning it would silently lose the data after it.
+
 Before that, `read(fd, NULL, 0)` asks the kernel whether `fd` can be read without reading
 anything. If it fails (closed fd, write-only fd, directory), the stash is freed: old
 leftovers can never come out of a file opened later on the same fd number.
@@ -84,7 +109,8 @@ leftovers can never come out of a file opened later on the same fd number.
   rebuilt by appending; many lines in one read (huge buffer) stay in the stash for the
   next calls.
 - Memory is bounded: the stash never holds more than one line + one buffer, and it is
-  freed at EOF or on error, so no leaks (checked with valgrind).
+  freed at EOF or on error, so no leaks (checked with valgrind, also while every malloc
+  fails in turn).
 - `gnl_strjoin` always frees the old stash, so `stash = gnl_strjoin(stash, buf)` can never
   leak, even when malloc fails.
 

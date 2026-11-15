@@ -13,6 +13,12 @@
 **   ./gnl_test file.txt         print a file line by line, cat -e style
 **   ./gnl_test -                same, reading from stdin
 **
+** malloc-failure build (each malloc of get_next_line fails once, in turn):
+**   cc -c -include tests/fail_malloc.h get_next_line.c get_next_line_utils.c
+**   cc -D GNL_FAIL_MALLOC tests/main.c get_next_line.o get_next_line_utils.o \
+**      -o gnl_malloc && ./gnl_malloc malloc
+**   (tests/run.sh does this for you, with valgrind / leaks on top)
+**
 ** Each test runs in its own process (fork), so a segfault or an infinite
 ** loop shows up as CRASH / TIMEOUT and the other tests keep running.
 ** It also gives every test a fresh static variable.
@@ -24,6 +30,10 @@
 **   CRASH    killed by a signal (segfault, abort, double free...)
 **   TIMEOUT  still running after TIMEOUT_S seconds
 */
+
+#ifdef GNL_FAIL_MALLOC
+# undef malloc
+#endif
 
 #include <dirent.h>
 #include <errno.h>
@@ -554,6 +564,148 @@ static void	t_strict_close_mid_file(void)
 	close(fd1);
 }
 
+/*
+** A real read() error in the middle of a file: after line 1 a directory
+** is put on the same fd number (dup2), so the next read() fails with
+** EISDIR. Lines already in the stash may still come out, but they must
+** be the right ones, and then get_next_line must return NULL.
+** Returns the fd (now the directory) so the strict test can go on.
+*/
+static int	read_error_mid_file(void)
+{
+	const char	*rest[] = {"line 2\n", "line 3\n", "line 4\n"};
+	int			fd = open_content("line 1\nline 2\nline 3\nline 4\n");
+	int			dir = open(g_tmpdir, O_RDONLY);
+	char		*got;
+	int			k;
+
+	expect(fd, "line 1\n", "before the error: call #1");
+	dup2(dir, fd);
+	close(dir);
+	for (k = 0; k < 4; k++)
+	{
+		got = get_next_line(fd);
+		if (!got)
+			break ;
+		if (k == 3 || strcmp(got, rest[k]) != 0)
+		{
+			fail_header("after read() failed: wrong line (must be NULL or the next line)");
+			if (g_details <= MAX_DETAILS)
+			{
+				show("expected", k < 3 ? rest[k] : NULL);
+				show("got", got);
+			}
+			free(got);
+			return (fd);
+		}
+		free(got);
+	}
+	expect(fd, NULL, "fd still failing: must stay NULL");
+	return (fd);
+}
+
+static void	t_read_error(void)
+{
+	close(read_error_mid_file());
+}
+
+/* STRICT: after the error, the static must not keep old bytes */
+static void	t_strict_after_read_error(void)
+{
+	int	fd = read_error_mid_file();
+	int	fd2 = open_content("new file 1\nnew file 2\n");
+
+	dup2(fd2, fd);
+	close(fd2);
+	expect_content(fd, "new file 1\nnew file 2\n",
+		"new file on the same fd after the error: no old leftovers");
+	close(fd);
+}
+
+#ifdef GNL_FAIL_MALLOC
+/*
+** Built with -include fail_malloc.h on the student's files only: their
+** malloc() goes through here. Pass n makes their n-th malloc return NULL,
+** and the passes go on until every malloc of a full read has failed once.
+*/
+static long	g_malloc_fail_at = -1;
+static long	g_malloc_count;
+
+void	*gnl_test_malloc(size_t size)
+{
+	if (g_malloc_count++ == g_malloc_fail_at)
+		return (NULL);
+	return (malloc(size));
+}
+
+static size_t	next_line_len(const char *p)
+{
+	const char	*nl = strchr(p, '\n');
+
+	return (nl ? (size_t)(nl - p + 1) : strlen(p));
+}
+
+static void	t_malloc_fail(void)
+{
+	const char	*c = "first line\nsecond line\n\nfourth line, no newline";
+	char		*path = make_file(c);
+	char		*got;
+	char		*want;
+	const char	*p;
+	char		ctx[200];
+	long		n;
+	long		total = 0;
+	int			k;
+	int			fd;
+
+	for (n = 0; n < 1000; n++)
+	{
+		fd = open(path, O_RDONLY);
+		p = c;
+		g_malloc_count = 0;
+		g_malloc_fail_at = n;
+		for (k = 0; k < 8; k++)
+		{
+			got = get_next_line(fd);
+			if (!got)
+				break ;
+			if (!*p || strlen(got) != next_line_len(p)
+				|| strncmp(got, p, next_line_len(p)) != 0)
+			{
+				snprintf(ctx, sizeof(ctx), "malloc #%ld returned NULL: call #%d"
+					" gave a wrong line (must be NULL or the right line)", n + 1, k + 1);
+				fail_header(ctx);
+				want = *p ? strndup(p, next_line_len(p)) : NULL;
+				if (g_details <= MAX_DETAILS)
+				{
+					show("expected", want);
+					show("got", got);
+				}
+				free(want);
+				free(got);
+				break ;
+			}
+			p += next_line_len(p);
+			free(got);
+		}
+		total = g_malloc_count;
+		g_malloc_fail_at = -1;
+		while ((got = get_next_line(fd)))
+			free(got);
+		close(fd);
+		if (total <= n)
+			break ;
+	}
+	if (n == 0 && total == 0)
+		printf("         %s(malloc could not be intercepted on this system:"
+			" test skipped)%s\n", C_DIM, C_RESET);
+	else if (!g_fail)
+		printf("         %s%ld malloc calls, each one failed once: no crash,"
+			" no wrong line%s\n", C_DIM, n, C_RESET);
+	free(path);
+}
+#endif
+
 /* BUFFER_SIZE <= 0: every call must return NULL (no crash, no read) */
 static void	t_bs_not_positive(void)
 {
@@ -761,7 +913,12 @@ static const t_test	g_tests[] = {
 	{"standard input (fd 0)", t_stdin, MANDATORY},
 	{"directory fd / write-only fd", t_bad_fd_types, MANDATORY},
 	{"same fd number reused after EOF", t_reuse_fd_after_eof, MANDATORY},
+	{"read() fails in the middle of a file", t_read_error, MANDATORY},
 	{"close() mid-file, reopen same fd", t_strict_close_mid_file, STRICT},
+	{"read() error, then a new file on that fd", t_strict_after_read_error, STRICT},
+#ifdef GNL_FAIL_MALLOC
+	{"malloc fails (every call, one at a time)", t_malloc_fail, MANDATORY},
+#endif
 	{"bonus: 3 files interleaved", t_bonus_three_files, BONUS},
 	{"bonus: long lines interleaved", t_bonus_long_lines, BONUS},
 	{"bonus: file + pipe + stdin", t_bonus_file_pipe_stdin, BONUS},
@@ -786,6 +943,55 @@ static void	verdict(const t_test *t, const char *word, const char *color,
 		extra ? "  " : "", extra ? extra : "");
 }
 
+/*
+** Print what a test wrote. An AddressSanitizer report is cut down to the
+** error line, the first stack frames (file:line) and its summary.
+*/
+static void	print_child_output(char *out)
+{
+	char	*line;
+	char	*next;
+	int		frames = 0;
+
+	if (!strstr(out, "AddressSanitizer"))
+	{
+		for (line = out; line && *line; line = next)
+		{
+			next = strchr(line, '\n');
+			if (next)
+				*next++ = '\0';
+			printf("%s%s\n", line[0] == ' ' ? "" : "           ", line);
+		}
+		return ;
+	}
+	for (line = out; line && *line; line = next)
+	{
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		if (strstr(line, "ERROR: AddressSanitizer")
+			|| strstr(line, "SUMMARY: AddressSanitizer"))
+			printf("           %s\n", strstr(line, "AddressSanitizer"));
+		else if (strncmp(line, "    #", 5) == 0 && frames < 5)
+		{
+			frames++;
+			printf("           %s\n", line + 4);
+		}
+		else if (strncmp(line, "         ", 9) == 0)
+			printf("%s\n", line);
+	}
+}
+
+/* seconds before a test counts as TIMEOUT: GNL_TIMEOUT=n overrides 10 */
+static unsigned	timeout_s(void)
+{
+	const char	*env = getenv("GNL_TIMEOUT");
+
+	if (env && atoi(env) > 0)
+		return ((unsigned)atoi(env));
+	return (TIMEOUT_S);
+}
+
 static void	run_forked(const t_test *t, t_stats *st, int quiet)
 {
 	int		p[2];
@@ -804,8 +1010,9 @@ static void	run_forked(const t_test *t, t_stats *st, int quiet)
 	{
 		close(p[0]);
 		dup2(p[1], STDOUT_FILENO);
+		dup2(p[1], STDERR_FILENO);
 		close(p[1]);
-		alarm(TIMEOUT_S);
+		alarm(timeout_s());
 		g_fail = 0;
 		g_details = 0;
 		t->fn();
@@ -828,7 +1035,9 @@ static void	run_forked(const t_test *t, t_stats *st, int quiet)
 	if (WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM)
 	{
 		st->timeout++;
-		verdict(t, "TIMEOUT", C_RED, "(infinite loop or very slow)");
+		snprintf(buf, sizeof(buf), "(still running after %u s: infinite loop or very slow)",
+			timeout_s());
+		verdict(t, "TIMEOUT", C_RED, buf);
 	}
 	else if (WIFSIGNALED(status))
 	{
@@ -852,7 +1061,7 @@ static void	run_forked(const t_test *t, t_stats *st, int quiet)
 		verdict(t, "KO", C_RED, NULL);
 	}
 	if (out && (!quiet || WIFSIGNALED(status) || WEXITSTATUS(status)))
-		fputs(out, stdout);
+		print_child_output(out);
 	free(out);
 }
 
@@ -942,6 +1151,7 @@ int	main(int argc, char **argv)
 	int		bonus = 0;
 	int		fork_mode = 1;
 	int		quiet = 0;
+	int		only_malloc = 0;
 	int		i;
 	size_t	k;
 	t_stats	st = {0, 0, 0, 0, 0};
@@ -955,6 +1165,8 @@ int	main(int argc, char **argv)
 			fork_mode = 0;
 		else if (strcmp(argv[i], "-q") == 0)
 			quiet = 1;
+		else if (strcmp(argv[i], "malloc") == 0)
+			only_malloc = 1;
 		else
 			return (print_mode(argv[i]));
 	}
@@ -987,6 +1199,8 @@ int	main(int argc, char **argv)
 			t.kind = MANDATORY;
 		}
 		if (t.kind == BONUS && !bonus)
+			continue ;
+		if (only_malloc && strncmp(t.name, "malloc fails", 12) != 0)
 			continue ;
 		if (fork_mode)
 			run_forked(&t, &st, quiet);

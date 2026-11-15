@@ -67,21 +67,38 @@ static char	*extract_line(const char *stash)
 }
 
 /*
-** Step 3 - KEEP THE REST: drop the line we just returned from the stash.
-** If nothing is left, the stash is freed and becomes NULL.
+** Frees the stash, sets it to NULL and returns NULL, so every
+** "give up" path is a single line: return (drop_stash(&stash));
 */
-static char	*trim_stash(char *stash, size_t line_len)
+static char	*drop_stash(char **stash)
+{
+	free(*stash);
+	*stash = NULL;
+	return (NULL);
+}
+
+/*
+** Step 3 - KEEP THE REST: replace the stash with what comes after the
+** line (NULL if nothing is left). Returns 0 if malloc fails: the stash
+** is then dropped, because the rest of the data is lost.
+*/
+static int	trim_stash(char **stash, size_t line_len)
 {
 	char	*rest;
 
-	if (!stash[line_len])
+	rest = NULL;
+	if ((*stash)[line_len])
 	{
-		free(stash);
-		return (NULL);
+		rest = gnl_substr(*stash, line_len, gnl_strlen(*stash) - line_len);
+		if (!rest)
+		{
+			drop_stash(stash);
+			return (0);
+		}
 	}
-	rest = gnl_substr(stash, line_len, gnl_strlen(stash) - line_len);
-	free(stash);
-	return (rest);
+	free(*stash);
+	*stash = rest;
+	return (1);
 }
 
 /*
@@ -98,19 +115,15 @@ char	*get_next_line(int fd)
 	if (fd < 0 || fd >= FD_MAX || BUFFER_SIZE <= 0)
 		return (NULL);
 	if (read(fd, NULL, 0) < 0)
-	{
-		free(stash[fd]);
-		stash[fd] = NULL;
-		return (NULL);
-	}
+		return (drop_stash(&stash[fd]));
 	stash[fd] = fill_stash(fd, stash[fd]);
 	line = extract_line(stash[fd]);
 	if (!line)
+		return (drop_stash(&stash[fd]));
+	if (!trim_stash(&stash[fd], gnl_strlen(line)))
 	{
-		free(stash[fd]);
-		stash[fd] = NULL;
+		free(line);
 		return (NULL);
 	}
-	stash[fd] = trim_stash(stash[fd], gnl_strlen(line));
 	return (line);
 }
